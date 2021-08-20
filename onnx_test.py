@@ -1,3 +1,5 @@
+from torch2trt import TRTModule
+from torch2trt import torch2trt
 import torch
 from torchvision import transforms
 from PIL import Image, ImageDraw
@@ -96,6 +98,9 @@ def get_boxes(score, geo, score_thresh=0.9, nms_thresh=0.2):
     Output:
         boxes       : final polys <numpy.ndarray, (n,9)>
     '''
+
+    print(score)
+    print(geo)
     score = score[0,:,:]
     xy_text = np.argwhere(score > score_thresh) # n x 2, format is [r, c]
     if xy_text.size == 0:
@@ -141,7 +146,6 @@ def detect(img, model, device):
         detected polys
     '''
     img, ratio_h, ratio_w = resize_img(img)
-    print("img shape for model: {}".format(img.size))
     with torch.no_grad():
         score, geo = model(load_pil(img).to(device))
     boxes = get_boxes(score.squeeze(0).cpu().numpy(), geo.squeeze(0).cpu().numpy())
@@ -189,12 +193,26 @@ if __name__ == '__main__':
     model = EAST().to(device)
     model.load_state_dict(torch.load(model_path))
     model.eval()
-    img = Image.open(img_path)
+    x = torch.randn(1, 3, 512, 512, requires_grad=False).to(device)
+    #img = Image.open(img_path)
     start = time.time()
-    boxes = detect(img, model, device)
+    #boxes = detect(img, model, device)
+    with torch.no_grad():
+        score, geo = model(x)
     end = time.time()
     print("time: {}".format(end-start))
-    plot_img = plot_boxes(img, boxes)
-    plot_img.save(res_img)
+    #plot_img = plot_boxes(img, boxes)
+    #plot_img.save(res_img)
+
+    print("Saving to trt compatible model")
+    # convert to TensorRT feeding sample data as input
+    #model_trt = torch2trt(model, [x])
+    input_names = [ "input_1" ]
+    output_names = [ "score", "geo" ]
+    torch.onnx.export(model, x, "east.onnx", verbose=False, export_params=True,
+                          opset_version=11,
+                          do_constant_folding=True,
+                          input_names=input_names, output_names=output_names,
+                          dynamic_axes=None)
 
 

@@ -372,6 +372,7 @@ class custom_dataset(data.Dataset):
 		super(custom_dataset, self).__init__()
 		self.img_files = [os.path.join(img_path, img_file) for img_file in sorted(os.listdir(img_path))]
 		self.gt_files  = [os.path.join(gt_path, gt_file) for gt_file in sorted(os.listdir(gt_path))]
+		print("gt_files: {}".format(self.gt_files))
 		self.scale = scale
 		self.length = length
 
@@ -379,7 +380,7 @@ class custom_dataset(data.Dataset):
 		return len(self.img_files)
 
 	def __getitem__(self, index):
-		with open(self.gt_files[index], 'r') as f:
+		with open(self.gt_files[index], 'r', encoding='utf-8-sig') as f:
 			lines = f.readlines()
 		vertices, labels = extract_vertices(lines)
 		

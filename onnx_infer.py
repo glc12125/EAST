@@ -1,12 +1,25 @@
-import torch
-from torchvision import transforms
-from PIL import Image, ImageDraw
-from model import EAST
-import os
-from dataset import get_rotate_mat
+import onnxruntime
+import sys
+import cv2
 import numpy as np
 import lanms
 import time
+from PIL import Image, ImageDraw
+
+
+from dataset import get_rotate_mat
+
+
+def plot_boxes(img, boxes):
+    '''plot boxes on image
+    '''
+    if boxes is None:
+        return img
+
+    draw = ImageDraw.Draw(img)
+    for box in boxes:
+        draw.polygon([box[0], box[1], box[2], box[3], box[4], box[5], box[6], box[7]], outline=(0,255,0))
+    return img
 
 def resize_img(img):
     '''resize image to be divisible by 32
@@ -23,14 +36,6 @@ def resize_img(img):
 
     return img, ratio_h, ratio_w
 
-
-def load_pil(img):
-    '''convert PIL Image to torch.Tensor
-    '''
-    t = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=(0.5,0.5,0.5),std=(0.5,0.5,0.5))])
-    return t(img).unsqueeze(0)
-
-
 def is_valid_poly(res, score_shape, scale):
     '''check if the poly in image scope
     Input:
@@ -46,7 +51,6 @@ def is_valid_poly(res, score_shape, scale):
            res[1,i] < 0 or res[1,i] >= score_shape[0] * scale:
             cnt += 1
     return True if cnt <= 1 else False
-
 
 def restore_polys(valid_pos, valid_geo, score_shape, scale=4):
     '''restore polys from feature maps in given positions
@@ -85,7 +89,6 @@ def restore_polys(valid_pos, valid_geo, score_shape, scale=4):
             polys.append([res[0,0], res[1,0], res[0,1], res[1,1], res[0,2], res[1,2],res[0,3], res[1,3]])
     return np.array(polys), index
 
-
 def get_boxes(score, geo, score_thresh=0.9, nms_thresh=0.2):
     '''get boxes from feature map
     Input:
@@ -96,6 +99,11 @@ def get_boxes(score, geo, score_thresh=0.9, nms_thresh=0.2):
     Output:
         boxes       : final polys <numpy.ndarray, (n,9)>
     '''
+    print("score.shape: {}".format(score.shape))
+    print("geo.shape: {}".format(geo.shape))
+    if type(score).__name__ != 'ndarray':
+        score = score.squeeze(0).cpu().detach().numpy()
+        geo = geo.squeeze(0).cpu().detach().numpy()
     score = score[0,:,:]
     xy_text = np.argwhere(score > score_thresh) # n x 2, format is [r, c]
     if xy_text.size == 0:
@@ -114,87 +122,79 @@ def get_boxes(score, geo, score_thresh=0.9, nms_thresh=0.2):
     boxes = lanms.merge_quadrangle_n9(boxes.astype('float32'), nms_thresh)
     return boxes
 
-
-def adjust_ratio(boxes, ratio_w, ratio_h):
-    '''refine boxes
-    Input:
-        boxes  : detected polys <numpy.ndarray, (n,9)>
-        ratio_w: ratio of width
-        ratio_h: ratio of height
-    Output:
-        refined boxes
-    '''
-    if boxes is None or boxes.size == 0:
-        return None
-    boxes[:,[0,2,4,6]] /= ratio_w
-    boxes[:,[1,3,5,7]] /= ratio_h
-    return np.around(boxes)
-
-
-def detect(img, model, device):
-    '''detect text regions of img using model
-    Input:
-        img   : PIL Image
-        model : detection model
-        device: gpu if gpu is available
-    Output:
-        detected polys
-    '''
-    img, ratio_h, ratio_w = resize_img(img)
-    print("img shape for model: {}".format(img.size))
-    with torch.no_grad():
-        score, geo = model(load_pil(img).to(device))
-    boxes = get_boxes(score.squeeze(0).cpu().numpy(), geo.squeeze(0).cpu().numpy())
-    return adjust_ratio(boxes, ratio_w, ratio_h)
+def resize_boxes(boxes, original_w, original_h, w, h):
+	ratio_w = original_w / w
+	ratio_h = original_h / h
+	for r in range(len(boxes)):
+		points = boxes[r]
+		print("[DEBUG] detected boxes on resized images: {}".format(points))
+		points[0] *= ratio_w
+		points[2] *= ratio_w
+		points[4] *= ratio_w
+		points[6] *= ratio_w
+		points[1] *= ratio_h
+		points[3] *= ratio_h
+		points[5] *= ratio_h
+		points[7] *= ratio_h
+		print("[DEBUG] resized boxes on original images: {}".format(points))
 
 
-def plot_boxes(img, boxes):
-    '''plot boxes on image
-    '''
-    if boxes is None:
-        return img
 
-    draw = ImageDraw.Draw(img)
-    for box in boxes:
-        draw.polygon([box[0], box[1], box[2], box[3], box[4], box[5], box[6], box[7]], outline=(0,255,0))
-    return img
+def detect(session, image_src):
+    IN_IMAGE_H = session.get_inputs()[0].shape[2]
+    IN_IMAGE_W = session.get_inputs()[0].shape[3]
 
+    # Input
+    #image_src = Image.open(img_path)
+    #img, ratio_h, ratio_w = resize_img(image_src)
+    original_h, original_w = image_src.shape[:2]
+    resized = cv2.resize(image_src, (IN_IMAGE_W, IN_IMAGE_H), interpolation=cv2.INTER_LINEAR)
+    img_in = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    img_in = np.transpose(img_in, (2, 0, 1)).astype(np.float32)
+    img_in = np.expand_dims(img_in, axis=0)
+    img_in /= 255.0
+    print("Shape of the network input: ", img_in.shape)
 
-def detect_dataset(model, device, test_img_path, submit_path):
-    '''detection on whole dataset, save .txt results in submit_path
-    Input:
-        model        : detection model
-        device       : gpu if gpu is available
-        test_img_path: dataset path
-        submit_path  : submit result for evaluation
-    '''
-    img_files = os.listdir(test_img_path)
-    img_files = sorted([os.path.join(test_img_path, img_file) for img_file in img_files])
+    # Compute
+    input_name = session.get_inputs()[0].name
 
-    for i, img_file in enumerate(img_files):
-        print('evaluating {} image'.format(i), end='\r')
-        boxes = detect(Image.open(img_file), model, device)
-        seq = []
-        if boxes is not None:
-            seq.extend([','.join([str(int(b)) for b in box[:-1]]) + '\n' for box in boxes])
-        with open(os.path.join(submit_path, 'res_' + os.path.basename(img_file).replace('.jpg','.txt')), 'w') as f:
-            f.writelines(seq)
+    outputs = session.run(None, {input_name: img_in})
 
+    boxes = get_boxes(outputs[0].squeeze(0), outputs[1].squeeze(0))
+    #return adjust_ratio(boxes, ratio_w, ratio_h)
+    resize_boxes(boxes, original_w, original_h, IN_IMAGE_W, IN_IMAGE_H)
+    return boxes, resized
+
+def main(weight_file, image_path, batch_size, IN_IMAGE_H = 704, IN_IMAGE_W = 1280):
+
+    session = onnxruntime.InferenceSession(weight_file)
+    # session = onnx.load(onnx_path)
+    print("The model expects input shape: ", session.get_inputs()[0].shape)
+    img = cv2.imread(image_path)
+    start = time.time()
+    boxes, resized = detect(session, img)
+    end = time.time()
+
+    start = time.time()
+    for i in range(10):
+    	boxes, resized = detect(session, img)
+    end = time.time()
+    print("time: {}".format((end-start)/10))
+    img = Image.open(image_path)
+    #img = Image.fromarray(resized, 'RGB')
+    plot_img = plot_boxes(img, boxes)
+    plot_img.save("result.png")
 
 if __name__ == '__main__':
-    img_path    = './ICDAR_2015/test_img/img_2.jpg'
-    model_path  = './pths/east_vgg16.pth'
-    res_img     = './res.bmp'
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    model = EAST().to(device)
-    model.load_state_dict(torch.load(model_path))
-    model.eval()
-    img = Image.open(img_path)
-    start = time.time()
-    boxes = detect(img, model, device)
-    end = time.time()
-    print("time: {}".format(end-start))
-    plot_img = plot_boxes(img, boxes)
-    plot_img.save(res_img)
+    print("Loading onnx model ...")
+    if len(sys.argv) == 6:
+        weight_file = sys.argv[1]
+        image_path = sys.argv[2]
+        batch_size = int(sys.argv[3])
+        IN_IMAGE_H = int(sys.argv[4])
+        IN_IMAGE_W = int(sys.argv[5])
 
-
+        main(weight_file, image_path, batch_size, IN_IMAGE_H, IN_IMAGE_W)
+    else:
+        print('Please run this way:\n')
+        print('  python onnx_infer.py <weight_file> <image_path> <batch_size> <IN_IMAGE_H> <IN_IMAGE_W>')
